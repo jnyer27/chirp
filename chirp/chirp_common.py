@@ -1635,6 +1635,17 @@ class CloneModeRadio(FileBackedRadio, ExternalMemoryProperties,
         """Return the radio's memory map object"""
         return self._mmap
 
+    def apply_setting(self, name, value):
+        """Apply a single setting by name and value to the memory struct.
+
+        Optional. When implemented, the bridge (e.g. Android clone mode) will call
+        this for each setting when set_settings(ui) does not persist on the runtime.
+        Override in the driver with the same logic as set_settings() for that name.
+        Default is no-op so drivers work unchanged; override for runtimes where
+        tree->struct does not persist.
+        """
+        pass
+
     @property
     def metadata(self):
         return dict(self._metadata)

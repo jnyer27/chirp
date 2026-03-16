@@ -134,3 +134,8 @@ class TemplateRadio(chirp_common.CloneModeRadio):
         # Convert to low-level frequency representation
         _mem.freq = mem.freq
         _mem.name = mem.name.ljust(8)[:8]  # Store the alpha tag
+
+    # If your driver has get_settings/set_settings and will be used in clone mode on
+    # runtimes where set_settings(ui) does not persist (e.g. Android), override
+    # apply_setting(self, name, value) with the same logic as set_settings for each name.
+    # See tidradio_h3_nicfw25.py and ANDROID_CLONE_SETTINGS.md in the app python root.

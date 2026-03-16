@@ -1056,3 +1056,36 @@ class TestRadioFeatures(base.BaseTest):
             rf.valid_tones = [100.0, 300.0]
         with self.assertRaises(ValueError):
             rf.valid_tones = [100, 107.2]
+
+
+class TestCloneModeRadioApplySetting(base.BaseTest):
+    """Test apply_setting() hook used by Android clone settings flow."""
+
+    def test_apply_setting_default_noop(self):
+        from chirp import memmap
+        # Minimal clone so we can instantiate without a real image file
+        class _MinimalClone(chirp_common.CloneModeRadio):
+            VENDOR = 'Test'
+            MODEL = 'Minimal'
+            _memsize = 100
+        radio = _MinimalClone(memmap.MemoryMapBytes(b'\x00' * 100))
+        # Base implementation is no-op; should not raise
+        radio.apply_setting('foo', 42)
+        radio.apply_setting('lcdBrightness', 27)
+
+    def test_apply_setting_override_invoked(self):
+        from chirp import memmap
+        applied = []
+
+        class _RecordingClone(chirp_common.CloneModeRadio):
+            VENDOR = 'Test'
+            MODEL = 'Recording'
+            _memsize = 100
+
+            def apply_setting(self, name, value):
+                applied.append((name, value))
+
+        radio = _RecordingClone(memmap.MemoryMapBytes(b'\x00' * 100))
+        radio.apply_setting('a', 1)
+        radio.apply_setting('b', 'two')
+        self.assertEqual(applied, [('a', 1), ('b', 'two')])

@@ -377,6 +377,26 @@ def _decode_tone(tone_word):
     return None, None, None
 
 
+def _chirp_dtcs_from_firmware_raw(dcs_code):
+    """
+    Map 9-bit firmware sub-tone payload to chirp_common.Memory.dtcs / rx_dtcs.
+
+    Memory only accepts ALL_DTCS_CODES (three octal digits 0-7 as a decimal int,
+    e.g. 125). Some EEPROMs store a linear index 0..511 into that list instead;
+    e.g. raw 85 -> code 125. Other tools may write raw values that are not valid
+    digit triples (85 has an illegal 8); treat those as indices when in range.
+    """
+    if dcs_code is None:
+        return None
+    raw = int(dcs_code)
+    codes = chirp_common.ALL_DTCS_CODES
+    if raw in codes:
+        return raw
+    if 0 <= raw < len(codes):
+        return codes[raw]
+    return min(codes, key=lambda c: abs(c - raw))
+
+
 def _encode_tone(mode, value, polarity=None):
     """Encode (mode, value, polarity) to 16-bit tone word (big-endian stored by bitwise)."""
     if mode == "Tone" and value is not None:
@@ -440,6 +460,10 @@ def _channel_to_memory(memobj, number, mem):
     mem.mode = MODULATION_LIST[int(_mem.modulation)] if int(_mem.modulation) < len(MODULATION_LIST) else "FM"
     txmode, txval, txpol = _decode_tone(_mem.txSubTone)
     rxmode, rxval, rxpol = _decode_tone(_mem.rxSubTone)
+    if txmode == "DTCS" and txval is not None:
+        txval = _chirp_dtcs_from_firmware_raw(txval)
+    if rxmode == "DTCS" and rxval is not None:
+        rxval = _chirp_dtcs_from_firmware_raw(rxval)
     chirp_common.split_tone_decode(mem, (txmode, txval, txpol), (rxmode, rxval, rxpol))
     # Extra: groups (letters A-O from Group Labels), bandwidth. Comment column left blank (not populated from groups).
     mem.extra = RadioSettingGroup("extra", "Extra")
@@ -602,7 +626,10 @@ class TH3NicFw25(chirp_common.CloneModeRadio):
             want_narrow = bool(mem.extra and any(e.get_name() == "bandwidth" and "Narrow" in str(e.value) for e in mem.extra))
             off = 0x40 + index * 32 + 15
             if off + 1 <= len(self._mmap):
-                self._mmap[off] = (self._mmap[off] & 0xFE) | (1 if want_narrow else 0)
+                cur = self._mmap[off]
+                # MemoryMapBytes / Chaquopy may return int or length-1 bytes; Py3 rejects bytes & int.
+                cur_b = cur[0] if isinstance(cur, (bytes, bytearray)) else int(cur)
+                self._mmap[off] = (cur_b & 0xFE) | (1 if want_narrow else 0)
 
     def get_settings(self):
         s = self._memobj.settings

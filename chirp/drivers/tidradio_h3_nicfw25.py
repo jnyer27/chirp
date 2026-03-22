@@ -226,7 +226,29 @@ NUM_BLOCKS = EEPROM_SIZE // BLOCK_SIZE  # 256
 
 # Channel/settings constants
 MODULATION_LIST = ["Auto", "FM", "AM", "USB"]
+# chirp_common.MODES-style labels for FM/AM + narrow (EEPROM still stores modulation + bandwidth bit).
+NFM = "NFM"
+NAM = "NAM"
+# Memory editor / validate_memory: includes NFM/NAM alongside EEPROM modulation names.
+VALID_MODES = ["Auto", "FM", NFM, "AM", NAM, "USB"]
 BANDWIDTH_LIST = ["Wide", "Narrow"]
+
+
+def _extra_bandwidth_is_narrow(mem):
+    """True if Memory.extra lists bandwidth Narrow (legacy saves / UI)."""
+    extra = getattr(mem, "extra", None)
+    if not extra:
+        return False
+    try:
+        for e in extra:
+            try:
+                if e.get_name() == "bandwidth" and "Narrow" in str(e.value):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 GROUPS_LIST = ["None", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O"]
 # txPower: 0 = N/T (No Transmit); 1..Max Power = transmit level (Max Power = settings VHF/UHF, e.g. 130).
 POWERLEVEL_LIST = ["N/T"] + [str(x) for x in range(1, 256)]
@@ -457,7 +479,16 @@ def _channel_to_memory(memobj, number, mem):
             else:
                 name_parts.append("")
         mem.name = "".join(name_parts).rstrip() or ""
-    mem.mode = MODULATION_LIST[int(_mem.modulation)] if int(_mem.modulation) < len(MODULATION_LIST) else "FM"
+    mod_idx = int(_mem.modulation) if int(_mem.modulation) < len(MODULATION_LIST) else 1
+    mod_str = MODULATION_LIST[mod_idx]
+    bw_bit = int(raw[15]) & 1 if raw and len(raw) > 15 else 0
+    is_narrow = bool(bw_bit)
+    if mod_str == "FM" and is_narrow:
+        mem.mode = NFM
+    elif mod_str == "AM" and is_narrow:
+        mem.mode = NAM
+    else:
+        mem.mode = mod_str
     txmode, txval, txpol = _decode_tone(_mem.txSubTone)
     rxmode, rxval, rxpol = _decode_tone(_mem.rxSubTone)
     if txmode == "DTCS" and txval is not None:
@@ -476,9 +507,8 @@ def _channel_to_memory(memobj, number, mem):
     for slot, val in [("group1", g0), ("group2", g1), ("group3", g2), ("group4", g3)]:
         rs = RadioSetting(slot, "Groups slot %s (letter)" % slot[-1], RadioSettingValueList(GROUPS_LIST, GROUPS_LIST[val]))
         mem.extra.append(rs)
-    # Bandwidth is bit 0 of flags byte. 0=Wide, 1=Narrow (display swapped to match radio labels).
-    bw_bit = int(raw[15]) & 1 if raw and len(raw) > 15 else 0
-    bw = "Narrow" if bw_bit else "Wide"
+    # Bandwidth is bit 0 of flags byte. 0=Wide, 1=Narrow — extra mirrors mem.mode (NFM/NAM ↔ Narrow).
+    bw = "Narrow" if is_narrow else "Wide"
     mem.extra.append(RadioSetting("bandwidth", "Bandwidth", RadioSettingValueList(BANDWIDTH_LIST, bw)))
     # Busy Lock is bit 7 of flags byte.  ✓ confirmed via EEPROM diff.
     busy_lock = bool((int(raw[15]) >> 7) & 1) if raw and len(raw) > 15 else False
@@ -514,8 +544,18 @@ def _memory_to_channel(memobj, number, mem):
     name = (mem.name or "")[:12].ljust(12)
     for i, c in enumerate(name):
         _mem.name[i] = ord(c) if ord(c) < 256 else 0x20
-    _mem.modulation = MODULATION_LIST.index(mem.mode) if mem.mode in MODULATION_LIST else 0
-    _mem.bandwidth = 1 if mem.extra and any(e.get_name() == "bandwidth" and "Narrow" in str(e.value) for e in mem.extra) else 0
+    if mem.mode == NFM:
+        _mem.modulation = MODULATION_LIST.index("FM")
+        _mem.bandwidth = 1
+    elif mem.mode == NAM:
+        _mem.modulation = MODULATION_LIST.index("AM")
+        _mem.bandwidth = 1
+    elif mem.mode in MODULATION_LIST:
+        _mem.modulation = MODULATION_LIST.index(mem.mode)
+        _mem.bandwidth = 1 if _extra_bandwidth_is_narrow(mem) else 0
+    else:
+        _mem.modulation = 0
+        _mem.bandwidth = 1 if _extra_bandwidth_is_narrow(mem) else 0
     # Busy Lock is incompatible with repeater/split operation (radio rule).
     _busy_requested = bool(mem.extra and any(e.get_name() == "busyLock" and bool(e.value) for e in mem.extra))
     _mem.busyLock  = 1 if (_busy_requested and mem.duplex not in ("+", "-", "split")) else 0
@@ -626,7 +666,7 @@ class TH3NicFw25(chirp_common.CloneModeRadio):
         _memory_to_channel(self._memobj, index, mem)
         # Bandwidth is bit 0 of channel byte 15; 0=Wide, 1=Narrow (patch mmap to match).
         if not mem.empty and hasattr(self, "_mmap") and self._mmap is not None:
-            want_narrow = bool(mem.extra and any(e.get_name() == "bandwidth" and "Narrow" in str(e.value) for e in mem.extra))
+            want_narrow = mem.mode in (NFM, NAM) or _extra_bandwidth_is_narrow(mem)
             off = 0x40 + index * 32 + 15
             if off + 1 <= len(self._mmap):
                 cur = self._mmap[off]

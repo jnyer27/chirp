@@ -465,7 +465,10 @@ def _channel_to_memory(memobj, number, mem):
     if rxmode == "DTCS" and rxval is not None:
         rxval = _chirp_dtcs_from_firmware_raw(rxval)
     chirp_common.split_tone_decode(mem, (txmode, txval, txpol), (rxmode, rxval, rxpol))
-    # Extra: groups (letters A-O from Group Labels), bandwidth. Comment column left blank (not populated from groups).
+    # Everything beyond chirp_common.Memory's universal fields (freq, name, mode, duplex,
+    # offset, power, tones, tuning_step, skip, comment, empty, …) belongs in mem.extra only:
+    # per-slot groups, bandwidth (firmware bit distinct from mode label), and busyLock (BCL).
+    # See https://github.com/kk7ds/chirp/blob/master/chirp/chirp_common.py — class Memory.
     mem.extra = RadioSettingGroup("extra", "Extra")
     g = int(_mem.groups)
     g0, g1, g2, g3 = (g >> 0) & 0xF, (g >> 4) & 0xF, (g >> 8) & 0xF, (g >> 12) & 0xF

@@ -32,6 +32,68 @@ class TestH3FwChirpModeMap(unittest.TestCase):
         self.assertIn(h3.NAM, rf.valid_modes)
 
 
+class TestH3DcsFirmwareIndex(unittest.TestCase):
+    """nicFW stores DTCS as ALL_DTCS_CODES index in 9 bits, not CHIRP literal."""
+
+    def test_index_21_is_dcs_025_chirp_25(self):
+        self.assertEqual(h3._chirp_dtcs_from_firmware_raw(21), 25)
+
+    def test_chirp_25_encodes_as_index_21(self):
+        self.assertEqual(h3._encode_tone("DTCS", 25, "N"), 0x8000 | 21)
+
+    def test_chirp_25_encodes_reverse_polarity_bit(self):
+        self.assertEqual(h3._encode_tone("DTCS", 25, "R"), 0x8000 | 0x4000 | 21)
+
+    def test_decode_tone_dcs_uses_index_payload(self):
+        mode, val, pol = h3._decode_tone(0x8000 | 21)
+        self.assertEqual(mode, "DTCS")
+        self.assertEqual(val, 21)
+        self.assertEqual(pol, "N")
+        self.assertEqual(h3._chirp_dtcs_from_firmware_raw(val), 25)
+
+
+class TestH3ValidateMemoryBandwidth(unittest.TestCase):
+    def _radio_slot1(self):
+        data = bytearray(8192)
+        data[0x1900] = 0xD8
+        data[0x1901] = 0x2F
+        f10 = 14652000
+        data[0x40:0x44] = f10.to_bytes(4, "big")
+        data[0x44:0x48] = f10.to_bytes(4, "big")
+        r = h3.TH3NicFw25(memmap.MemoryMapBytes(bytes(data)))
+        r.process_mmap()
+        return r
+
+    def test_nfm_with_wide_extra_is_validation_error(self):
+        r = self._radio_slot1()
+        mem = r.get_memory(1)
+        mem.mode = h3.NFM
+        for item in mem.extra:
+            if item.get_name() == "bandwidth" and hasattr(item.value, "set_value"):
+                item.value.set_value("Wide")
+        msgs = r.validate_memory(mem)
+        kinds = [type(m).__name__ for m in msgs]
+        self.assertIn("ValidationError", kinds)
+
+    def test_nfm_with_narrow_extra_ok(self):
+        r = self._radio_slot1()
+        mem = r.get_memory(1)
+        mem.mode = h3.NFM
+        for item in mem.extra:
+            if item.get_name() == "bandwidth" and hasattr(item.value, "set_value"):
+                item.value.set_value("Narrow")
+        msgs = r.validate_memory(mem)
+        self.assertFalse(any(type(m).__name__ == "ValidationError" for m in msgs))
+
+    def test_nfm_leaves_eeprom_wide_in_extra_errors(self):
+        """Wide FM slot; mode-only NFM leaves bandwidth RadioSetting as Wide — invalid."""
+        r = self._radio_slot1()
+        mem = r.get_memory(1)
+        mem.mode = h3.NFM
+        msgs = r.validate_memory(mem)
+        self.assertTrue(any(type(m).__name__ == "ValidationError" for m in msgs))
+
+
 class TestH3EepromRoundTrip(unittest.TestCase):
     def _fresh_mmap(self):
         data = bytearray(8192)
@@ -76,6 +138,24 @@ class TestH3EepromRoundTrip(unittest.TestCase):
         r.set_memory(mem)
         out = r.get_memory(1)
         self.assertEqual(out.mode, h3.NFM)
+
+    def test_raw_flags_byte_bit0_is_narrow_fm(self):
+        """nicFW stores narrow in bit0; modulation FM=1 in bits 1–2 (see MEM_FORMAT bit order)."""
+        data = bytearray(8192)
+        data[0x1900] = 0xD8
+        data[0x1901] = 0x2F
+        f10 = 14652000
+        data[0x40:0x44] = f10.to_bytes(4, "big")
+        data[0x44:0x48] = f10.to_bytes(4, "big")
+        # FM (index 1) + narrow: bit0=1, bits1-2=01 → value 3; wide FM would be 2.
+        data[0x40 + 15] = 3
+        r = h3.TH3NicFw25(memmap.MemoryMapBytes(bytes(data)))
+        r.process_mmap()
+        self.assertEqual(r.get_memory(1).mode, h3.NFM)
+        data[0x40 + 15] = 2
+        r = h3.TH3NicFw25(memmap.MemoryMapBytes(bytes(data)))
+        r.process_mmap()
+        self.assertEqual(r.get_memory(1).mode, "FM")
 
 
 if __name__ == "__main__":

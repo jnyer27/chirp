@@ -44,12 +44,15 @@ struct {
     u16 txSubTone;
     u8 txPower;
     u16 groups;      // g0:4, g1:4, g2:4, g3:4
-    u8 bandwidth:1,
-       modulation:2,
-       position:1,
-       pttID:2,
+    // CHIRP bitwise packs first-declared bitfield at the MSB of the byte (bit 7),
+    // last at LSB (bit 0). nicFW wire order is bit0=bandwidth, bit7=busyLock,
+    // bits1-2=modulation, bit3=position, bits4-5=pttID, bit6=reversed — so declare MSB→LSB.
+    u8 busyLock:1,
        reversed:1,
-       busyLock:1;
+       pttID:2,
+       position:1,
+       modulation:2,
+       bandwidth:1;
     char reserved[4];
     char name[12];
 } vfoA;
@@ -62,12 +65,12 @@ struct {
     u16 txSubTone;
     u8 txPower;
     u16 groups;
-    u8 bandwidth:1,
-       modulation:2,
-       position:1,
-       pttID:2,
+    u8 busyLock:1,
        reversed:1,
-       busyLock:1;
+       pttID:2,
+       position:1,
+       modulation:2,
+       bandwidth:1;
     char reserved[4];
     char name[12];
 } vfoB;
@@ -80,12 +83,12 @@ struct {
     u16 txSubTone;
     u8 txPower;
     u16 groups;
-    u8 bandwidth:1,
-       modulation:2,
-       position:1,
-       pttID:2,
+    u8 busyLock:1,
        reversed:1,
-       busyLock:1;
+       pttID:2,
+       position:1,
+       modulation:2,
+       bandwidth:1;
     char reserved[4];
     char name[12];
 } memory[198];
@@ -232,6 +235,27 @@ NAM = "NAM"
 # Memory editor / validate_memory: includes NFM/NAM alongside EEPROM modulation names.
 VALID_MODES = ["Auto", "FM", NFM, "AM", NAM, "USB"]
 BANDWIDTH_LIST = ["Wide", "Narrow"]
+
+
+def _extra_bandwidth_value_str(mem):
+    """Return the Bandwidth extra list value as a string, or None if unset/missing."""
+    extra = getattr(mem, "extra", None)
+    if not extra:
+        return None
+    try:
+        for e in extra:
+            try:
+                if e.get_name() != "bandwidth":
+                    continue
+                val = e.value
+                if hasattr(val, "get_value"):
+                    return str(val.get_value())
+                return str(val)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
 
 
 def _extra_bandwidth_is_narrow(mem):
@@ -444,7 +468,9 @@ def _decode_tone(tone_word):
     if tone_word & 0x8000:
         dcs_code = tone_word & 0x01FF
         polarity = "R" if (tone_word & 0x4000) else "N"
-        if 1 <= dcs_code <= 511:
+        # 9-bit field is a linear index into ALL_DTCS_CODES (0..511), not the CHIRP
+        # integer (e.g. index 21 -> DCS 025 -> Memory value 25). Allow 0..511.
+        if 0 <= dcs_code <= 511:
             return "DTCS", dcs_code, polarity
     return None, None, None
 
@@ -453,20 +479,33 @@ def _chirp_dtcs_from_firmware_raw(dcs_code):
     """
     Map 9-bit firmware sub-tone payload to chirp_common.Memory.dtcs / rx_dtcs.
 
-    Memory only accepts ALL_DTCS_CODES (three octal digits 0-7 as a decimal int,
-    e.g. 125). Some EEPROMs store a linear index 0..511 into that list instead;
-    e.g. raw 85 -> code 125. Other tools may write raw values that are not valid
-    digit triples (85 has an illegal 8); treat those as indices when in range.
+    nicFW 2.5 stores a linear index 0..511 into ALL_DTCS_CODES (same pattern as
+    e.g. icf520 / many Kenwood-style drivers), not the CHIRP code integer.
+
+    A raw value like 21 is both a valid index (DCS 025 -> 25) and a valid CHIRP
+    code (021 -> 21). The radio uses the index interpretation; treating 21 as
+    a literal code mis-shows 021 instead of 025.
     """
     if dcs_code is None:
         return None
     raw = int(dcs_code)
     codes = chirp_common.ALL_DTCS_CODES
-    if raw in codes:
-        return raw
     if 0 <= raw < len(codes):
         return codes[raw]
     return min(codes, key=lambda c: abs(c - raw))
+
+
+def _dtcs_chirp_value_to_firmware_index(value):
+    """CHIRP Memory dtcs/rx_dtcs integer -> 9-bit EEPROM index for _encode_tone."""
+    if value is None:
+        return 0
+    codes = chirp_common.ALL_DTCS_CODES
+    v = int(value)
+    try:
+        return codes.index(v)
+    except ValueError:
+        nearest = min(codes, key=lambda c: abs(c - v))
+        return codes.index(nearest)
 
 
 def _encode_tone(mode, value, polarity=None):
@@ -475,8 +514,9 @@ def _encode_tone(mode, value, polarity=None):
         tone_word = int(round(value * 10.0))
         if 0 <= tone_word <= 3000:
             return tone_word
-    if mode == "DTCS" and value is not None and 1 <= value <= 511:
-        tone_word = 0x8000 | value
+    if mode == "DTCS" and value is not None:
+        idx = _dtcs_chirp_value_to_firmware_index(value) & 0x1FF
+        tone_word = 0x8000 | idx
         if polarity == "R" or polarity == "I":
             tone_word |= 0x4000
         return tone_word
@@ -553,8 +593,8 @@ def _channel_to_memory(memobj, number, mem):
     # Bandwidth is bit 0 of flags byte. 0=Wide, 1=Narrow — extra mirrors mem.mode (NFM/NAM ↔ Narrow).
     bw = "Narrow" if is_narrow else "Wide"
     mem.extra.append(RadioSetting("bandwidth", "Bandwidth", RadioSettingValueList(BANDWIDTH_LIST, bw)))
-    # Busy Lock is bit 7 of flags byte.  ✓ confirmed via EEPROM diff.
-    busy_lock = bool((int(raw[15]) >> 7) & 1) if raw and len(raw) > 15 else False
+    # Busy Lock is bit 7 of flags byte (matches MEM_FORMAT after MSB→LSB field order).
+    busy_lock = bool(int(_mem.busyLock))
     mem.extra.append(RadioSetting("busyLock", "Busy Lock", RadioSettingValueBoolean(busy_lock)))
     # Step is global in the radio (Settings only). Per-memory tuning_step is for display; default 12.5 kHz.
     mem.tuning_step = next((s for s in VALID_TUNING_STEPS_HZ if mem.freq % s == 0), DEFAULT_TUNING_STEP_HZ)
@@ -653,11 +693,17 @@ class TH3NicFw25(chirp_common.CloneModeRadio):
         rf.valid_tmodes = ["", "Tone", "TSQL", "DTCS", "Cross"]
         rf.valid_cross_modes = ["Tone->Tone", "Tone->DTCS", "DTCS->Tone", "->Tone", "->DTCS", "DTCS->", "DTCS->DTCS"]
         rf.valid_characters = chirp_common.CHARSET_ASCII
+        # Hardware RX span per nicFW Programmer / band plan (TX still limited by firmware plan).
+        # CHIRP uses lo <= freq < hi; hi = 600_000_001 Hz so 600.0 MHz is included.
         rf.valid_bands = [
-            (76000000, 108000000),   # FM broadcast (RX only; TX blocked by band plan)
-            (136000000, 174000000),  # VHF TX/RX
-            (400000000, 480000000),  # UHF TX/RX
+            (50_000_000, 600_000_001),
         ]
+        # Finer nicFW Programmer reference (RX-only sub-ranges; single band above unless we split):
+        #   (50_000_000, 76_000_000),      # Low VHF / FM
+        #   (108_000_000, 136_000_000),    # AM airband (8.33 kHz steps, AM demod)
+        #   (174_000_000, 350_000_000),    # Extended VHF
+        #   (350_000_000, 400_000_000),    # UHF / emergency / military
+        #   (470_000_000, 600_000_001),    # Extended UHF
         rf.valid_modes = list(VALID_MODES)
         rf.valid_duplexes = ["", "-", "+", "split", "off"]
         rf.valid_skips = ["", "S"]
@@ -710,6 +756,20 @@ class TH3NicFw25(chirp_common.CloneModeRadio):
         if not mem.empty and hasattr(self, "_mmap") and self._mmap is not None:
             _apply_channel_bandwidth_bit0_to_mmap(
                 self._mmap, index, _channel_memory_wants_narrow(mem))
+
+    def validate_memory(self, mem):
+        """Cross-check NFM/NAM vs Memory.extra bandwidth (RadioDroid / mmap path)."""
+        msgs = super().validate_memory(mem)
+        if getattr(mem, "empty", True):
+            return msgs
+        if mem.mode in (NFM, NAM):
+            bw = _extra_bandwidth_value_str(mem)
+            if bw is not None and "Narrow" not in bw:
+                msgs.append(
+                    chirp_common.ValidationError(
+                        "Mode %s requires narrow bandwidth in Radio Specific settings; "
+                        "set Bandwidth to Narrow or use FM/AM for wideband." % mem.mode))
+        return msgs
 
     def get_settings(self):
         s = self._memobj.settings

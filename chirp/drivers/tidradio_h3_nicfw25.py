@@ -242,13 +242,63 @@ def _extra_bandwidth_is_narrow(mem):
     try:
         for e in extra:
             try:
-                if e.get_name() == "bandwidth" and "Narrow" in str(e.value):
+                if e.get_name() != "bandwidth":
+                    continue
+                val = e.value
+                if hasattr(val, "get_value"):
+                    cur = val.get_value()
+                    if "Narrow" in str(cur):
+                        return True
+                elif "Narrow" in str(val):
                     return True
             except Exception:
                 continue
     except Exception:
         pass
     return False
+
+
+def _fw_channel_mode_to_chirp(mod_idx, is_narrow):
+    """Map EEPROM modulation index + narrow bit to chirp_common.Memory.mode."""
+    mod_idx = int(mod_idx)
+    if mod_idx >= len(MODULATION_LIST):
+        mod_idx = 1
+    mod_str = MODULATION_LIST[mod_idx]
+    if mod_str == "FM" and is_narrow:
+        return NFM
+    if mod_str == "AM" and is_narrow:
+        return NAM
+    return mod_str
+
+
+def _chirp_mode_to_fw_channel(mem):
+    """Return (modulation_index, narrow_bool) for channel EEPROM flags."""
+    if mem.mode == NFM:
+        return MODULATION_LIST.index("FM"), True
+    if mem.mode == NAM:
+        return MODULATION_LIST.index("AM"), True
+    if mem.mode in MODULATION_LIST:
+        return MODULATION_LIST.index(mem.mode), _extra_bandwidth_is_narrow(mem)
+    return 0, _extra_bandwidth_is_narrow(mem)
+
+
+def _channel_memory_wants_narrow(mem):
+    """True if mem should encode narrow bandwidth bit (single source for set_memory / mmap patch)."""
+    return _chirp_mode_to_fw_channel(mem)[1]
+
+
+def _apply_channel_bandwidth_bit0_to_mmap(mmap, index, want_narrow):
+    """Ensure byte 15 bit0 matches narrow (0=Wide, 1=Narrow); preserves other flag bits."""
+    if mmap is None or index < 0:
+        return
+    off = 0x40 + index * 32 + 15
+    if off + 1 > len(mmap):
+        return
+    cur = mmap[off]
+    cur_b = cur[0] if isinstance(cur, (bytes, bytearray)) else int(cur)
+    mmap[off] = (cur_b & 0xFE) | (1 if want_narrow else 0)
+
+
 GROUPS_LIST = ["None", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O"]
 # txPower: 0 = N/T (No Transmit); 1..Max Power = transmit level (Max Power = settings VHF/UHF, e.g. 130).
 POWERLEVEL_LIST = ["N/T"] + [str(x) for x in range(1, 256)]
@@ -480,15 +530,8 @@ def _channel_to_memory(memobj, number, mem):
                 name_parts.append("")
         mem.name = "".join(name_parts).rstrip() or ""
     mod_idx = int(_mem.modulation) if int(_mem.modulation) < len(MODULATION_LIST) else 1
-    mod_str = MODULATION_LIST[mod_idx]
-    bw_bit = int(raw[15]) & 1 if raw and len(raw) > 15 else 0
-    is_narrow = bool(bw_bit)
-    if mod_str == "FM" and is_narrow:
-        mem.mode = NFM
-    elif mod_str == "AM" and is_narrow:
-        mem.mode = NAM
-    else:
-        mem.mode = mod_str
+    is_narrow = bool(int(_mem.bandwidth))
+    mem.mode = _fw_channel_mode_to_chirp(mod_idx, is_narrow)
     txmode, txval, txpol = _decode_tone(_mem.txSubTone)
     rxmode, rxval, rxpol = _decode_tone(_mem.rxSubTone)
     if txmode == "DTCS" and txval is not None:
@@ -615,7 +658,7 @@ class TH3NicFw25(chirp_common.CloneModeRadio):
             (136000000, 174000000),  # VHF TX/RX
             (400000000, 480000000),  # UHF TX/RX
         ]
-        rf.valid_modes = MODULATION_LIST
+        rf.valid_modes = list(VALID_MODES)
         rf.valid_duplexes = ["", "-", "+", "split", "off"]
         rf.valid_skips = ["", "S"]
         rf.valid_name_length = 12
@@ -664,15 +707,9 @@ class TH3NicFw25(chirp_common.CloneModeRadio):
     def set_memory(self, mem):
         index = mem.number - 1  # CHIRP 1-198 -> radio memory[0]..[197]
         _memory_to_channel(self._memobj, index, mem)
-        # Bandwidth is bit 0 of channel byte 15; 0=Wide, 1=Narrow (patch mmap to match).
         if not mem.empty and hasattr(self, "_mmap") and self._mmap is not None:
-            want_narrow = mem.mode in (NFM, NAM) or _extra_bandwidth_is_narrow(mem)
-            off = 0x40 + index * 32 + 15
-            if off + 1 <= len(self._mmap):
-                cur = self._mmap[off]
-                # MemoryMapBytes / Chaquopy may return int or length-1 bytes; Py3 rejects bytes & int.
-                cur_b = cur[0] if isinstance(cur, (bytes, bytearray)) else int(cur)
-                self._mmap[off] = (cur_b & 0xFE) | (1 if want_narrow else 0)
+            _apply_channel_bandwidth_bit0_to_mmap(
+                self._mmap, index, _channel_memory_wants_narrow(mem))
 
     def get_settings(self):
         s = self._memobj.settings
